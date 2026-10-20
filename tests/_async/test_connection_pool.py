@@ -650,6 +650,426 @@ async def test_connection_pool_concurrency_same_domain_keepalive():
     )
 
 
+ORIGIN_HTTP11_RESPONSE = [
+    b"HTTP/1.1 200 OK\r\n",
+    b"Content-Type: plain/text\r\n",
+    b"Content-Length: 13\r\n",
+    b"\r\n",
+    b"Hello, world!",
+]
+
+
+class _SequenceMockBackend(httpcore.AsyncMockBackend):
+    """
+    Each newly established connection gets the next buffer in a sequence,
+    rather than every connection sharing a copy of the same buffer. This
+    allows tests to script distinct HTTP/2 connections.
+    """
+
+    def __init__(self, buffers: list[list[bytes]]) -> None:
+        super().__init__(buffer=buffers[0], http2=True)
+        self._buffers = list(buffers)
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: typing.Iterable[typing.Any] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        return httpcore.AsyncMockStream(list(self._buffers.pop(0)), http2=True)
+
+
+def _h2_settings_frame() -> bytes:
+    # A server SETTINGS frame that allows multiple concurrent streams, so
+    # the client releases its initial single-stream concurrency permit.
+    frame = hyperframe.frame.SettingsFrame()
+    frame.settings = {hyperframe.frame.SettingsFrame.MAX_CONCURRENT_STREAMS: 100}
+    return frame.serialize()
+
+
+def _h2_response_frames(stream_id: int) -> list[bytes]:
+    return [
+        hyperframe.frame.HeadersFrame(
+            stream_id=stream_id,
+            data=hpack.Encoder().encode(
+                [
+                    (b":status", b"200"),
+                    (b"content-type", b"plain/text"),
+                ]
+            ),
+            flags=["END_HEADERS"],
+        ).serialize(),
+        hyperframe.frame.DataFrame(
+            stream_id=stream_id, data=b"Hello, world!", flags=["END_STREAM"]
+        ).serialize(),
+    ]
+
+
+@pytest.mark.anyio
+async def test_connection_pool_retirement_disabled_by_default():
+    """
+    When the retirement limits are not configured the pool exposes `None`
+    values and behaves as it always did.
+    """
+    network_backend = httpcore.AsyncMockBackend(ORIGIN_HTTP11_RESPONSE)
+
+    async with httpcore.AsyncConnectionPool(
+        network_backend=network_backend,
+    ) as pool:
+        assert pool._max_connection_requests is None
+        assert pool._max_connection_age is None
+
+        response = await pool.request("GET", "https://example.com/")
+        assert response.content == b"Hello, world!"
+        assert pool.connections[0].is_available()
+        assert not pool.connections[0].has_expired()
+
+
+@pytest.mark.anyio
+async def test_connection_pool_http11_max_connection_requests():
+    """
+    An HTTP/1.1 connection may service exactly `max_connection_requests`
+    requests. The final response is read to completion, after which the
+    connection is unavailable, expired, and reclaimed by the pool, and the
+    next request uses a new connection.
+    """
+    network_backend = httpcore.AsyncMockBackend(ORIGIN_HTTP11_RESPONSE * 3)
+
+    async with httpcore.AsyncConnectionPool(
+        max_connection_requests=2,
+        network_backend=network_backend,
+    ) as pool:
+        response = await pool.request("GET", "https://example.com/")
+        assert response.content == b"Hello, world!"
+
+        assert len(pool.connections) == 1
+        first = pool.connections[0]
+        assert (
+            repr(first)
+            == "<AsyncHTTPConnection ['https://example.com:443', HTTP/1.1, IDLE, "
+            "Request Count: 1]>"
+        )
+        assert first.is_available()
+
+        # The second (and final) request must complete successfully...
+        async with pool.stream("GET", "https://example.com/") as response:
+            assert (
+                repr(pool.connections[0])
+                == "<AsyncHTTPConnection ['https://example.com:443', HTTP/1.1, "
+                "ACTIVE, Request Count: 2, MAX_REQUESTS]>"
+            )
+            await response.aread()
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # ...and once the response stream is closed the retired connection
+        # is immediately reclaimed by the pool.
+        assert pool.connections == []
+
+        # The third request cannot reuse the retired connection, and so
+        # results in a brand new connection being opened.
+        response = await pool.request("GET", "https://example.com/")
+        assert response.content == b"Hello, world!"
+        assert len(pool.connections) == 1
+        assert pool.connections[0] is not first
+        assert (
+            repr(pool.connections[0])
+            == "<AsyncHTTPConnection ['https://example.com:443', HTTP/1.1, IDLE, "
+            "Request Count: 1]>"
+        )
+
+
+@pytest.mark.anyio
+async def test_connection_pool_http2_max_connection_requests():
+    """
+    An HTTP/2 connection that has opened `max_connection_requests` streams is
+    not assigned any new request, and is expired once it returns to idle.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        buffer=[
+            _h2_settings_frame(),
+            # Two streams are opened on the first connection.
+            *_h2_response_frames(stream_id=1),
+            *_h2_response_frames(stream_id=3),
+            # A fresh connection gets its own copy of this backend buffer,
+            # so the trailing frames for the first connection are enough.
+        ],
+        http2=True,
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        http2=True,
+        max_connection_requests=2,
+        network_backend=network_backend,
+    ) as pool:
+        response = await pool.request("GET", "https://example.com/")
+        assert response.content == b"Hello, world!"
+
+        assert len(pool.connections) == 1
+        first = pool.connections[0]
+        assert first.is_available()
+        assert (
+            repr(first)
+            == "<AsyncHTTPConnection ['https://example.com:443', HTTP/2, IDLE, "
+            "Request Count: 1]>"
+        )
+
+        # The second (and final) stream must complete successfully...
+        async with pool.stream("GET", "https://example.com/") as response:
+            assert (
+                repr(pool.connections[0])
+                == "<AsyncHTTPConnection ['https://example.com:443', HTTP/2, "
+                "ACTIVE, Request Count: 2, MAX_REQUESTS]>"
+            )
+            await response.aread()
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # ...and once the stream is closed the retired connection is
+        # immediately reclaimed by the pool.
+        assert pool.connections == []
+
+        # The third request requires a new HTTP/2 connection.
+        response = await pool.request("GET", "https://example.com/")
+        assert response.content == b"Hello, world!"
+        assert len(pool.connections) == 1
+        assert pool.connections[0] is not first
+        assert (
+            repr(pool.connections[0])
+            == "<AsyncHTTPConnection ['https://example.com:443', HTTP/2, IDLE, "
+            "Request Count: 1]>"
+        )
+
+
+@pytest.mark.anyio
+async def test_connection_pool_http2_max_connection_requests_in_flight():
+    """
+    When an HTTP/2 connection reaches its request limit while streams are
+    still open, no further stream may be opened on it, but the existing
+    streams must still be read to completion and release their concurrency
+    permits, allowing the connection to return to idle and be reclaimed.
+    """
+    network_backend = _SequenceMockBackend(
+        buffers=[
+            [
+                _h2_settings_frame(),
+                # Response headers for both streams...
+                hyperframe.frame.HeadersFrame(
+                    stream_id=1,
+                    data=hpack.Encoder().encode(
+                        [
+                            (b":status", b"200"),
+                            (b"content-type", b"plain/text"),
+                        ]
+                    ),
+                    flags=["END_HEADERS"],
+                ).serialize(),
+                hyperframe.frame.HeadersFrame(
+                    stream_id=3,
+                    data=hpack.Encoder().encode(
+                        [
+                            (b":status", b"200"),
+                            (b"content-type", b"plain/text"),
+                        ]
+                    ),
+                    flags=["END_HEADERS"],
+                ).serialize(),
+                # ...followed by both response bodies.
+                hyperframe.frame.DataFrame(
+                    stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]
+                ).serialize(),
+                hyperframe.frame.DataFrame(
+                    stream_id=3, data=b"Hello, world!", flags=["END_STREAM"]
+                ).serialize(),
+            ],
+            # The retired connection is replaced by a brand new one.
+            [_h2_settings_frame(), *_h2_response_frames(stream_id=1)],
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        http2=True,
+        max_connection_requests=2,
+        network_backend=network_backend,
+    ) as pool:
+        async with pool.stream("GET", "https://example.com/") as response1:
+            async with pool.stream("GET", "https://example.com/") as response2:
+                assert len(pool.connections) == 1
+                first = pool.connections[0]
+                assert not first.is_idle()
+                assert not first.is_available()
+                assert "MAX_REQUESTS" in repr(first)
+
+                # A third request must not hang waiting for a permit on the
+                # retired connection, nor open a new stream on it. It is
+                # serviced over a brand new connection.
+                response3 = await pool.request("GET", "https://example.com/")
+                assert response3.content == b"Hello, world!"
+                assert len(pool.connections) == 2
+                assert pool.connections[0] is first
+
+                # Closing one stream does not retire the connection while the
+                # other stream is still open.
+                await response2.aread()
+                assert response2.content == b"Hello, world!"
+                assert not first.is_idle()
+
+            # The remaining stream can be read to completion and releases
+            # its permit, allowing the connection to return to idle.
+            await response1.aread()
+            assert response1.content == b"Hello, world!"
+
+        # Once both streams are closed the retired connection is reclaimed,
+        # leaving only the new connection in the pool.
+        assert len(pool.connections) == 1
+        assert pool.connections[0] is not first
+
+
+@pytest.mark.trio
+async def test_connection_pool_max_connection_age():
+    """
+    An idle connection older than `max_connection_age` is unavailable and
+    expired, and the next request opens a new connection.
+    """
+    network_backend = httpcore.AsyncMockBackend(ORIGIN_HTTP11_RESPONSE * 2)
+
+    async with httpcore.AsyncConnectionPool(
+        max_connection_age=0.1,
+        network_backend=network_backend,
+    ) as pool:
+        response = await pool.request("GET", "https://example.com/")
+        assert response.content == b"Hello, world!"
+
+        first = pool.connections[0]
+        assert first.is_available()
+        assert not first.has_expired()
+
+        await concurrency.sleep(0.3)
+
+        assert not first.is_available()
+        assert first.has_expired()
+        assert "MAX_AGE" in repr(first)
+
+        response = await pool.request("GET", "https://example.com/")
+        assert response.content == b"Hello, world!"
+        assert len(pool.connections) == 1
+        assert pool.connections[0] is not first
+        assert "Request Count: 1" in repr(pool.connections[0])
+
+
+@pytest.mark.trio
+async def test_connection_pool_max_connection_age_active_response():
+    """
+    Reaching the maximum age while a response is still being streamed must
+    not interrupt the in-flight response body.
+    """
+    network_backend = httpcore.AsyncMockBackend(ORIGIN_HTTP11_RESPONSE)
+
+    async with httpcore.AsyncConnectionPool(
+        max_connection_age=0.1,
+        network_backend=network_backend,
+    ) as pool:
+        async with pool.stream("GET", "https://example.com/") as response:
+            # The connection becomes over-age while the response is active.
+            await concurrency.sleep(0.3)
+            assert not pool.connections[0].is_idle()
+            assert not pool.connections[0].has_expired()
+
+            # The body may still be read in full.
+            await response.aread()
+            assert response.status == 200
+            assert response.content == b"Hello, world!"
+
+        # Once closed, the over-age idle connection is reclaimed.
+        assert pool.connections == []
+
+
+@pytest.mark.trio
+async def test_connection_pool_http2_max_connection_age():
+    """
+    An idle HTTP/2 connection older than `max_connection_age` is expired,
+    and the next request opens a new connection.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        buffer=[
+            _h2_settings_frame(),
+            *_h2_response_frames(stream_id=1),
+            # A fresh connection gets its own copy of this backend buffer.
+        ],
+        http2=True,
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        http2=True,
+        max_connection_age=0.1,
+        network_backend=network_backend,
+    ) as pool:
+        response = await pool.request("GET", "https://example.com/")
+        assert response.content == b"Hello, world!"
+
+        first = pool.connections[0]
+        assert first.is_available()
+
+        await concurrency.sleep(0.3)
+
+        assert not first.is_available()
+        assert first.has_expired()
+        assert "MAX_AGE" in repr(first)
+
+        response = await pool.request("GET", "https://example.com/")
+        assert response.content == b"Hello, world!"
+        assert len(pool.connections) == 1
+        assert pool.connections[0] is not first
+
+
+@pytest.mark.trio
+async def test_connection_pool_http2_max_connection_age_in_flight():
+    """
+    An HTTP/2 connection that becomes over-age while a stream is open does
+    not accept new streams, but the open stream can be read to completion.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        buffer=[
+            _h2_settings_frame(),
+            *_h2_response_frames(stream_id=1),
+            # A fresh connection gets its own copy of this backend buffer.
+        ],
+        http2=True,
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        http2=True,
+        max_connection_age=0.1,
+        network_backend=network_backend,
+    ) as pool:
+        async with pool.stream("GET", "https://example.com/") as response1:
+            assert len(pool.connections) == 1
+            first = pool.connections[0]
+
+            # The connection ages past the limit while the stream is open.
+            await concurrency.sleep(0.3)
+            assert not first.is_idle()
+            assert not first.is_available()
+            assert not first.has_expired()
+
+            # A second request is serviced over a new connection, without
+            # disturbing the in-flight stream.
+            response2 = await pool.request("GET", "https://example.com/")
+            assert response2.content == b"Hello, world!"
+            assert len(pool.connections) == 2
+            assert pool.connections[0] is first
+
+            # The in-flight stream completes normally and is reclaimed once
+            # it returns to idle.
+            await response1.aread()
+            assert response1.content == b"Hello, world!"
+
+        assert len(pool.connections) == 1
+        assert pool.connections[0] is not first
+
+
 @pytest.mark.anyio
 async def test_unsupported_protocol():
     async with httpcore.AsyncConnectionPool() as pool:

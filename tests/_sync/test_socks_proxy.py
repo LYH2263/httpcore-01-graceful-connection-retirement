@@ -62,6 +62,60 @@ def test_socks5_request():
 
 
 
+def test_socks5_request_with_max_connection_requests():
+    """
+    The `max_connection_requests` knob is propagated through the SOCKS5
+    handshake to the inner protocol connection, so a connection is retired
+    after the limit and replaced for the next request.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            # The initial socks CONNECT
+            #   v5 NOAUTH
+            b"\x05\x00",
+            #   v5 SUC RSV IP4 127  .0  .0  .1     :80
+            b"\x05\x00\x00\x01\xff\x00\x00\x01\x00\x50",
+            # The actual response from the remote server
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+        * 2
+    )
+
+    with httpcore.ConnectionPool(
+        proxy=httpcore.Proxy("socks5://localhost:8080/"),
+        max_connection_requests=1,
+        network_backend=network_backend,
+    ) as proxy:
+        with proxy.stream("GET", "https://example.com/") as response:
+            assert len(proxy.connections) == 1
+            first = proxy.connections[0]
+            assert (
+                repr(first)
+                == "<Socks5Connection ['https://example.com:443', HTTP/1.1, "
+                "ACTIVE, Request Count: 1, MAX_REQUESTS]>"
+            )
+            response.read()
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # Once the final response closes the retired connection is reclaimed.
+        assert proxy.connections == []
+
+        # The next request opens a fresh SOCKS5 connection.
+        with proxy.stream("GET", "https://example.com/") as response:
+            assert len(proxy.connections) == 1
+            second = proxy.connections[0]
+            assert second is not first
+            response.read()
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+
+
 def test_authenticated_socks5_request():
     """
     Send an HTTP request via a SOCKS proxy.

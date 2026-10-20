@@ -48,14 +48,24 @@ class HTTP2Connection(ConnectionInterface):
         origin: Origin,
         stream: NetworkStream,
         keepalive_expiry: float | None = None,
+        max_connection_requests: int | None = None,
+        max_connection_age: float | None = None,
     ):
         self._origin = origin
         self._network_stream = stream
         self._keepalive_expiry: float | None = keepalive_expiry
+        self._max_connection_requests: int | None = max_connection_requests
+        self._max_connection_age: float | None = max_connection_age
         self._h2_state = h2.connection.H2Connection(config=self.CONFIG)
         self._state = HTTPConnectionState.IDLE
         self._expire_at: float | None = None
         self._request_count = 0
+        # The connection age is measured from the point at which the
+        # underlying network stream has been established -- including any
+        # TLS or proxy handshaking -- rather than from the point at which
+        # the pool or a wrapper connection was instantiated. Protocol
+        # connections are only instantiated once the stream is ready.
+        self._created_at = time.monotonic()
         self._init_lock = Lock()
         self._state_lock = Lock()
         self._read_lock = Lock()
@@ -95,6 +105,11 @@ class HTTP2Connection(ConnectionInterface):
 
         with self._state_lock:
             if self._state in (HTTPConnectionState.ACTIVE, HTTPConnectionState.IDLE):
+                if self._max_requests_reached() or self._max_age_reached():
+                    # The connection is being gracefully retired. Existing
+                    # streams may continue to completion, but no new stream
+                    # may be opened on this connection.
+                    raise ConnectionNotAvailable()
                 self._request_count += 1
                 self._expire_at = None
                 self._state = HTTPConnectionState.ACTIVE
@@ -505,6 +520,24 @@ class HTTP2Connection(ConnectionInterface):
 
     # Interface for connection pooling...
 
+    def _max_requests_reached(self) -> bool:
+        # The number of requests (streams) opened on this connection has
+        # reached the configured `max_connection_requests` limit.
+        return (
+            self._max_connection_requests is not None
+            and self._request_count >= self._max_connection_requests
+        )
+
+    def _max_age_reached(self) -> bool:
+        # The underlying network connection has existed for longer than
+        # the configured `max_connection_age` duration.
+        if self._max_connection_age is None:
+            return False
+        return time.monotonic() - self._created_at > self._max_connection_age
+
+    def _is_retired(self) -> bool:
+        return self._max_requests_reached() or self._max_age_reached()
+
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._origin
 
@@ -517,11 +550,19 @@ class HTTP2Connection(ConnectionInterface):
                 self._h2_state.state_machine.state
                 == h2.connection.ConnectionState.CLOSED
             )
+            and not self._is_retired()
         )
 
     def has_expired(self) -> bool:
         now = time.monotonic()
-        return self._expire_at is not None and now > self._expire_at
+        keepalive_expired = self._expire_at is not None and now > self._expire_at
+
+        # A retired HTTP/2 connection is only expired once it is idle, so
+        # that streams which are still open can be read to completion and
+        # release their concurrency permit.
+        return self._state == HTTPConnectionState.IDLE and (
+            keepalive_expired or self._is_retired()
+        )
 
     def is_idle(self) -> bool:
         return self._state == HTTPConnectionState.IDLE
@@ -533,15 +574,23 @@ class HTTP2Connection(ConnectionInterface):
         origin = str(self._origin)
         return (
             f"{origin!r}, HTTP/2, {self._state.name}, "
-            f"Request Count: {self._request_count}"
+            f"Request Count: {self._request_count}{self._retirement_info()}"
         )
+
+    def _retirement_info(self) -> str:
+        info = ""
+        if self._max_requests_reached():
+            info += ", MAX_REQUESTS"
+        if self._max_age_reached():
+            info += ", MAX_AGE"
+        return info
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
         origin = str(self._origin)
         return (
             f"<{class_name} [{origin!r}, {self._state.name}, "
-            f"Request Count: {self._request_count}]>"
+            f"Request Count: {self._request_count}{self._retirement_info()}]>"
         )
 
     # These context managers are not used in the standard flow, but are

@@ -41,6 +41,8 @@ class HTTPConnection(ConnectionInterface):
         origin: Origin,
         ssl_context: ssl.SSLContext | None = None,
         keepalive_expiry: float | None = None,
+        max_connection_requests: int | None = None,
+        max_connection_age: float | None = None,
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
@@ -52,6 +54,8 @@ class HTTPConnection(ConnectionInterface):
         self._origin = origin
         self._ssl_context = ssl_context
         self._keepalive_expiry = keepalive_expiry
+        self._max_connection_requests = max_connection_requests
+        self._max_connection_age = max_connection_age
         self._http1 = http1
         self._http2 = http2
         self._retries = retries
@@ -89,12 +93,16 @@ class HTTPConnection(ConnectionInterface):
                             origin=self._origin,
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
+                            max_connection_requests=self._max_connection_requests,
+                            max_connection_age=self._max_connection_age,
                         )
                     else:
                         self._connection = HTTP11Connection(
                             origin=self._origin,
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
+                            max_connection_requests=self._max_connection_requests,
+                            max_connection_age=self._max_connection_age,
                         )
         except BaseException as exc:
             self._connect_failed = True

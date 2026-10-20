@@ -115,6 +115,8 @@ class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
         max_connections: int | None = 10,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = None,
+        max_connection_requests: int | None = None,
+        max_connection_age: float | None = None,
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
@@ -155,6 +157,8 @@ class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive_connections,
             keepalive_expiry=keepalive_expiry,
+            max_connection_requests=max_connection_requests,
+            max_connection_age=max_connection_age,
             http1=http1,
             http2=http2,
             network_backend=network_backend,
@@ -180,6 +184,8 @@ class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
             proxy_auth=self._proxy_auth,
             ssl_context=self._ssl_context,
             keepalive_expiry=self._keepalive_expiry,
+            max_connection_requests=self._max_connection_requests,
+            max_connection_age=self._max_connection_age,
             http1=self._http1,
             http2=self._http2,
             network_backend=self._network_backend,
@@ -194,6 +200,8 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
         proxy_auth: tuple[bytes, bytes] | None = None,
         ssl_context: ssl.SSLContext | None = None,
         keepalive_expiry: float | None = None,
+        max_connection_requests: int | None = None,
+        max_connection_age: float | None = None,
         http1: bool = True,
         http2: bool = False,
         network_backend: AsyncNetworkBackend | None = None,
@@ -203,6 +211,8 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
         self._proxy_auth = proxy_auth
         self._ssl_context = ssl_context
         self._keepalive_expiry = keepalive_expiry
+        self._max_connection_requests = max_connection_requests
+        self._max_connection_age = max_connection_age
         self._http1 = http1
         self._http2 = http2
 
@@ -283,12 +293,16 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
                             origin=self._remote_origin,
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
+                            max_connection_requests=self._max_connection_requests,
+                            max_connection_age=self._max_connection_age,
                         )
                     else:
                         self._connection = AsyncHTTP11Connection(
                             origin=self._remote_origin,
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
+                            max_connection_requests=self._max_connection_requests,
+                            max_connection_age=self._max_connection_age,
                         )
                 except Exception as exc:
                     self._connect_failed = True

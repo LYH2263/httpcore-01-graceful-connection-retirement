@@ -66,6 +66,8 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
         max_connections: int | None = 10,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = None,
+        max_connection_requests: int | None = None,
+        max_connection_age: float | None = None,
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
@@ -114,6 +116,8 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive_connections,
             keepalive_expiry=keepalive_expiry,
+            max_connection_requests=max_connection_requests,
+            max_connection_age=max_connection_age,
             http1=http1,
             http2=http2,
             network_backend=network_backend,
@@ -150,6 +154,8 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
                 proxy_headers=self._proxy_headers,
                 remote_origin=origin,
                 keepalive_expiry=self._keepalive_expiry,
+                max_connection_requests=self._max_connection_requests,
+                max_connection_age=self._max_connection_age,
                 network_backend=self._network_backend,
                 proxy_ssl_context=self._proxy_ssl_context,
             )
@@ -160,6 +166,8 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
             ssl_context=self._ssl_context,
             proxy_ssl_context=self._proxy_ssl_context,
             keepalive_expiry=self._keepalive_expiry,
+            max_connection_requests=self._max_connection_requests,
+            max_connection_age=self._max_connection_age,
             http1=self._http1,
             http2=self._http2,
             network_backend=self._network_backend,
@@ -173,6 +181,8 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
         remote_origin: Origin,
         proxy_headers: HeadersAsMapping | HeadersAsSequence | None = None,
         keepalive_expiry: float | None = None,
+        max_connection_requests: int | None = None,
+        max_connection_age: float | None = None,
         network_backend: AsyncNetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
         proxy_ssl_context: ssl.SSLContext | None = None,
@@ -180,6 +190,8 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
         self._connection = AsyncHTTPConnection(
             origin=proxy_origin,
             keepalive_expiry=keepalive_expiry,
+            max_connection_requests=max_connection_requests,
+            max_connection_age=max_connection_age,
             network_backend=network_backend,
             socket_options=socket_options,
             ssl_context=proxy_ssl_context,
@@ -239,6 +251,8 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         proxy_ssl_context: ssl.SSLContext | None = None,
         proxy_headers: typing.Sequence[tuple[bytes, bytes]] | None = None,
         keepalive_expiry: float | None = None,
+        max_connection_requests: int | None = None,
+        max_connection_age: float | None = None,
         http1: bool = True,
         http2: bool = False,
         network_backend: AsyncNetworkBackend | None = None,
@@ -247,6 +261,8 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         self._connection: AsyncConnectionInterface = AsyncHTTPConnection(
             origin=proxy_origin,
             keepalive_expiry=keepalive_expiry,
+            max_connection_requests=max_connection_requests,
+            max_connection_age=max_connection_age,
             network_backend=network_backend,
             socket_options=socket_options,
             ssl_context=proxy_ssl_context,
@@ -257,6 +273,8 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         self._proxy_ssl_context = proxy_ssl_context
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
         self._keepalive_expiry = keepalive_expiry
+        self._max_connection_requests = max_connection_requests
+        self._max_connection_age = max_connection_age
         self._http1 = http1
         self._http2 = http2
         self._connect_lock = AsyncLock()
@@ -331,12 +349,16 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
                         origin=self._remote_origin,
                         stream=stream,
                         keepalive_expiry=self._keepalive_expiry,
+                        max_connection_requests=self._max_connection_requests,
+                        max_connection_age=self._max_connection_age,
                     )
                 else:
                     self._connection = AsyncHTTP11Connection(
                         origin=self._remote_origin,
                         stream=stream,
                         keepalive_expiry=self._keepalive_expiry,
+                        max_connection_requests=self._max_connection_requests,
+                        max_connection_age=self._max_connection_age,
                     )
 
                 self._connected = True

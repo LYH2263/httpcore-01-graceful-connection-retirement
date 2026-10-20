@@ -218,6 +218,149 @@ async def test_proxy_tunneling_http2():
 
 
 @pytest.mark.anyio
+async def test_proxy_forwarding_with_max_connection_requests():
+    """
+    The `max_connection_requests` knob is propagated through a forwarding
+    proxy connection, retiring the underlying connection to the proxy.
+    """
+    network_backend = AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+        * 2
+    )
+
+    async with AsyncConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        max_connection_requests=1,
+        network_backend=network_backend,
+    ) as proxy:
+        async with proxy.stream("GET", "http://example.com/") as response:
+            assert len(proxy.connections) == 1
+            first = proxy.connections[0]
+            assert (
+                repr(first)
+                == "<AsyncForwardHTTPConnection ['http://localhost:8080', HTTP/1.1, "
+                "ACTIVE, Request Count: 1, MAX_REQUESTS]>"
+            )
+            await response.aread()
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # Once the final response closes the retired connection is reclaimed.
+        assert proxy.connections == []
+
+        # The next request opens a fresh connection to the proxy.
+        async with proxy.stream("GET", "http://example.com/") as response:
+            assert len(proxy.connections) == 1
+            second = proxy.connections[0]
+            assert second is not first
+            await response.aread()
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+
+@pytest.mark.anyio
+async def test_proxy_tunneling_with_max_connection_requests():
+    """
+    The `max_connection_requests` knob is propagated through an HTTP CONNECT
+    tunnel to the inner protocol connection that replaces the proxy
+    connection once the tunnel and TLS handshake are complete.
+    """
+    network_backend = AsyncMockBackend(
+        [
+            # A full connection: CONNECT response then the remote response.
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+        * 2
+    )
+
+    async with AsyncConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        max_connection_requests=1,
+        network_backend=network_backend,
+    ) as proxy:
+        async with proxy.stream("GET", "https://example.com/") as response:
+            assert len(proxy.connections) == 1
+            first = proxy.connections[0]
+            assert (
+                repr(first)
+                == "<AsyncTunnelHTTPConnection ['https://example.com:443', HTTP/1.1, "
+                "ACTIVE, Request Count: 1, MAX_REQUESTS]>"
+            )
+            await response.aread()
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # Once the final response closes the retired tunnel is reclaimed.
+        assert proxy.connections == []
+
+        # The next request establishes a fresh tunnel.
+        async with proxy.stream("GET", "https://example.com/") as response:
+            assert len(proxy.connections) == 1
+            second = proxy.connections[0]
+            assert second is not first
+            await response.aread()
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+
+@pytest.mark.trio
+async def test_proxy_tunneling_with_max_connection_age():
+    """
+    The `max_connection_age` knob is propagated through an HTTP CONNECT
+    tunnel, with age measured after the tunnel/TLS handshake rather than
+    from when the wrapper connection was created.
+    """
+    import trio as concurrency
+
+    network_backend = AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+        * 2
+    )
+
+    async with AsyncConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        max_connection_age=0.1,
+        network_backend=network_backend,
+    ) as proxy:
+        response = await proxy.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        first = proxy.connections[0]
+        assert first.is_available()
+
+        await concurrency.sleep(0.3)
+
+        assert not first.is_available()
+        assert first.has_expired()
+        assert "MAX_AGE" in repr(first)
+
+        response = await proxy.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert len(proxy.connections) == 1
+        assert proxy.connections[0] is not first
+
+
+@pytest.mark.anyio
 async def test_proxy_tunneling_with_403():
     """
     Send an HTTPS request via a proxy.

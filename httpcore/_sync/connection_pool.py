@@ -52,6 +52,8 @@ class ConnectionPool(RequestInterface):
         max_connections: int | None = 10,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = None,
+        max_connection_requests: int | None = None,
+        max_connection_age: float | None = None,
         http1: bool = True,
         http2: bool = False,
         retries: int = 0,
@@ -74,6 +76,16 @@ class ConnectionPool(RequestInterface):
                 that will be maintained in the pool.
             keepalive_expiry: The duration in seconds that an idle HTTP connection
                 may be maintained for before being expired from the pool.
+            max_connection_requests: The maximum number of requests that may be
+                sent over an individual connection before it is gracefully
+                retired. Any in-flight response is always allowed to complete,
+                but subsequent requests will be sent over a new connection.
+            max_connection_age: The maximum duration in seconds that an
+                individual connection may live, measured from when the
+                underlying network connection was established, before it is
+                gracefully retired. Any in-flight response is always allowed
+                to complete, but subsequent requests will be sent over a new
+                connection.
             http1: A boolean indicating if HTTP/1.1 requests should be supported
                 by the connection pool. Defaults to True.
             http2: A boolean indicating if HTTP/2 requests should be supported by
@@ -104,6 +116,8 @@ class ConnectionPool(RequestInterface):
         )
 
         self._keepalive_expiry = keepalive_expiry
+        self._max_connection_requests = max_connection_requests
+        self._max_connection_age = max_connection_age
         self._http1 = http1
         self._http2 = http2
         self._retries = retries
@@ -136,6 +150,8 @@ class ConnectionPool(RequestInterface):
                     remote_origin=origin,
                     ssl_context=self._ssl_context,
                     keepalive_expiry=self._keepalive_expiry,
+                    max_connection_requests=self._max_connection_requests,
+                    max_connection_age=self._max_connection_age,
                     http1=self._http1,
                     http2=self._http2,
                     network_backend=self._network_backend,
@@ -149,6 +165,8 @@ class ConnectionPool(RequestInterface):
                     proxy_ssl_context=self._proxy.ssl_context,
                     remote_origin=origin,
                     keepalive_expiry=self._keepalive_expiry,
+                    max_connection_requests=self._max_connection_requests,
+                    max_connection_age=self._max_connection_age,
                     network_backend=self._network_backend,
                 )
             from .http_proxy import TunnelHTTPConnection
@@ -160,6 +178,8 @@ class ConnectionPool(RequestInterface):
                 remote_origin=origin,
                 ssl_context=self._ssl_context,
                 keepalive_expiry=self._keepalive_expiry,
+                max_connection_requests=self._max_connection_requests,
+                max_connection_age=self._max_connection_age,
                 http1=self._http1,
                 http2=self._http2,
                 network_backend=self._network_backend,
@@ -169,6 +189,8 @@ class ConnectionPool(RequestInterface):
             origin=origin,
             ssl_context=self._ssl_context,
             keepalive_expiry=self._keepalive_expiry,
+            max_connection_requests=self._max_connection_requests,
+            max_connection_age=self._max_connection_age,
             http1=self._http1,
             http2=self._http2,
             retries=self._retries,

@@ -64,6 +64,19 @@ The connection pool instance is also the main point of configuration. Let's take
                                be maintained in the pool.
 * `keepalive_expiry`: The duration in seconds that an idle HTTP connection may be
                       maintained for before being expired from the pool.
+* `max_connection_requests`: The maximum number of requests that may be handled over
+                             a single connection. Once the limit is reached the
+                             connection completes any in-flight response, is not
+                             assigned any further request, and is expired from the
+                             pool once it returns to idle. Defaults to `None`, which
+                             means no limit is applied.
+* `max_connection_age`: The maximum lifetime in seconds of a single connection,
+                        measured from when the underlying network connection was
+                        established (after any TLS, HTTP proxy CONNECT or SOCKS
+                        handshake). A connection that exceeds the age while a
+                        response is still in flight is allowed to finish that
+                        response, and is only expired once it returns to idle.
+                        Defaults to `None`, which means no limit is applied.
 
 ### HTTP version support
 

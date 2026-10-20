@@ -49,14 +49,24 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         origin: Origin,
         stream: AsyncNetworkStream,
         keepalive_expiry: float | None = None,
+        max_connection_requests: int | None = None,
+        max_connection_age: float | None = None,
     ) -> None:
         self._origin = origin
         self._network_stream = stream
         self._keepalive_expiry: float | None = keepalive_expiry
+        self._max_connection_requests: int | None = max_connection_requests
+        self._max_connection_age: float | None = max_connection_age
         self._expire_at: float | None = None
         self._state = HTTPConnectionState.NEW
         self._state_lock = AsyncLock()
         self._request_count = 0
+        # The connection age is measured from the point at which the
+        # underlying network stream has been established -- including any
+        # TLS or proxy handshaking -- rather than from the point at which
+        # the pool or a wrapper connection was instantiated. Protocol
+        # connections are only instantiated once the stream is ready.
+        self._created_at = time.monotonic()
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
             max_incomplete_event_size=self.MAX_INCOMPLETE_EVENT_SIZE,
@@ -71,6 +81,11 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
 
         async with self._state_lock:
             if self._state in (HTTPConnectionState.NEW, HTTPConnectionState.IDLE):
+                if self._max_requests_reached() or self._max_age_reached():
+                    # The connection is being gracefully retired. Any
+                    # in-flight response is allowed to complete, but no new
+                    # request may be started on this connection.
+                    raise ConnectionNotAvailable()
                 self._request_count += 1
                 self._state = HTTPConnectionState.ACTIVE
                 self._expire_at = None
@@ -261,6 +276,24 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
     # the connection, allowing for a connection pooling implementation to
     # determine when to reuse and when to close the connection...
 
+    def _max_requests_reached(self) -> bool:
+        # The number of requests serviced by this connection has reached
+        # the configured `max_connection_requests` limit.
+        return (
+            self._max_connection_requests is not None
+            and self._request_count >= self._max_connection_requests
+        )
+
+    def _max_age_reached(self) -> bool:
+        # The underlying network connection has existed for longer than
+        # the configured `max_connection_age` duration.
+        if self._max_connection_age is None:
+            return False
+        return time.monotonic() - self._created_at > self._max_connection_age
+
+    def _is_retired(self) -> bool:
+        return self._max_requests_reached() or self._max_age_reached()
+
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._origin
 
@@ -269,7 +302,11 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         # being "available". The control flow which created the connection will
         # be able to send an outgoing request, but the connection will not be
         # acquired from the connection pool for any other request.
-        return self._state == HTTPConnectionState.IDLE
+        #
+        # Connections that are being retired because they have reached their
+        # request limit or maximum age must not service any new request, even
+        # once they return to the idle state.
+        return self._state == HTTPConnectionState.IDLE and not self._is_retired()
 
     def has_expired(self) -> bool:
         now = time.monotonic()
@@ -283,7 +320,11 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
             and self._network_stream.get_extra_info("is_readable")
         )
 
-        return keepalive_expired or server_disconnected
+        # A connection that is being retired is only expired once it is idle,
+        # so that an in-flight response body can always be read to completion.
+        retired = self._state == HTTPConnectionState.IDLE and self._is_retired()
+
+        return keepalive_expired or server_disconnected or retired
 
     def is_idle(self) -> bool:
         return self._state == HTTPConnectionState.IDLE
@@ -295,15 +336,23 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         origin = str(self._origin)
         return (
             f"{origin!r}, HTTP/1.1, {self._state.name}, "
-            f"Request Count: {self._request_count}"
+            f"Request Count: {self._request_count}{self._retirement_info()}"
         )
+
+    def _retirement_info(self) -> str:
+        info = ""
+        if self._max_requests_reached():
+            info += ", MAX_REQUESTS"
+        if self._max_age_reached():
+            info += ", MAX_AGE"
+        return info
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
         origin = str(self._origin)
         return (
             f"<{class_name} [{origin!r}, {self._state.name}, "
-            f"Request Count: {self._request_count}]>"
+            f"Request Count: {self._request_count}{self._retirement_info()}]>"
         )
 
     # These context managers are not used in the standard flow, but are

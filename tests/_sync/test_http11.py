@@ -378,3 +378,107 @@ def test_http11_header_sub_100kb():
         response = conn.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b""
+
+
+
+def test_http11_connection_with_max_connection_requests():
+    """
+    Once an HTTP/1.1 connection has handled `max_connection_requests` requests
+    it must complete the last request, then refuse any further request, be
+    unavailable, and report itself as expired so that the pool can reclaim it.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+        * 2
+    )
+    with httpcore.HTTPConnection(
+        origin=origin,
+        max_connection_requests=2,
+        network_backend=network_backend,
+    ) as conn:
+        # The first request completes and leaves the connection available.
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert conn.is_idle()
+        assert conn.is_available()
+        assert not conn.has_expired()
+
+        # The second, and final, request also completes successfully.
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # The connection is now idle but may not be used again.
+        assert conn.is_idle()
+        assert not conn.is_available()
+        assert conn.has_expired()
+        assert (
+            repr(conn)
+            == "<HTTPConnection ['https://example.com:443', HTTP/1.1, IDLE, "
+            "Request Count: 2, MAX_REQUESTS]>"
+        )
+
+        # Any further request on the connection is refused.
+        with pytest.raises(httpcore.ConnectionNotAvailable):
+            conn.request("GET", "https://example.com/")
+
+
+
+def test_http11_connection_with_max_connection_age():
+    """
+    Connection age is measured from when the underlying network stream was
+    established, not from when the connection (or the pool) was instantiated.
+    An over-age idle connection is unavailable and expired; an over-age but
+    still active response is never interrupted.
+    """
+    from tests import concurrency
+
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    network_backend = httpcore.MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+        * 3
+    )
+    with httpcore.HTTPConnection(
+        origin=origin,
+        max_connection_age=0.1,
+        network_backend=network_backend,
+    ) as conn:
+        # Waiting for much longer than the age limit before the first
+        # connect has no effect, because the clock starts at connect time.
+        concurrency.sleep(0.3)
+
+        # The first request connects and completes normally.
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert conn.is_available()
+        assert not conn.has_expired()
+
+        # A response that is in-flight when the age limit is reached is not
+        # interrupted, and can be read to completion.
+        with conn.stream("GET", "https://example.com/") as response:
+            concurrency.sleep(0.3)
+            assert not conn.is_idle()
+            assert not conn.has_expired()
+            response.read()
+            assert response.content == b"Hello, world!"
+
+        # Once back idle, the connection is expired by age.
+        assert conn.is_idle()
+        assert not conn.is_available()
+        assert conn.has_expired()
+        assert "MAX_AGE" in repr(conn)
